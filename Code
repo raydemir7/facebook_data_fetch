@@ -1,0 +1,182 @@
+import base64
+import functions_framework
+import requests
+import gspread
+from pprint import pprint
+from datetime import datetime, timedelta
+import time
+import json
+
+# Meta Ads access token and ad account ID
+ACCESS_TOKEN = xxx
+AD_ACCOUNT_ID = xxx
+
+# Define the API URL
+base_url = f'https://graph.facebook.com/v15.0/act_{AD_ACCOUNT_ID}/insights'
+
+# Function to fetch Meta Ads data with pagination support and specific date range
+def fetch_meta_ads_data():
+    start_date = "2023-08-10"  # Start date
+    end_date = datetime.today().strftime('%Y-%m-%d')  # End date
+
+    # Convert time_range to JSON format
+    time_range = json.dumps({"since": start_date, "until": end_date})
+
+    params = {
+        'fields': 'spend,clicks,impressions,actions,action_values',  # Include action_values for revenue
+        'access_token': ACCESS_TOKEN,
+        'time_increment': '1',  # Get daily breakdowns
+        'action_breakdowns': 'action_type',  # Breakdown data by action types (e.g., purchase)
+        'time_range': time_range  # Correctly formatted time_range as JSON string
+    }
+
+    all_data = []
+    url = base_url  # Initialize with the base URL for the first request
+
+    print(f"Requesting revenue, clicks, impressions, and purchase data from {start_date} to {end_date}...")
+
+    while url:
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()  # Check if there was an HTTP error
+            data = response.json()
+
+            # Log the full response for debugging
+            print(f"API Response: {json.dumps(data, indent=2)}")
+
+            # Collect data
+            all_data.extend(data.get('data', []))
+
+            # Check if more pages of data are available
+            paging = data.get('paging', {})
+            url = paging.get('next')  # Get the next page URL, if available
+            if url:
+                print("Fetching next page of data...")
+                params = {}  # Clear params for the next page (as URL already includes params)
+            else:
+                print("All pages fetched.")
+
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}")
+            break
+
+    return all_data
+
+
+# Function to extract totals for specific actions (revenue, spend, clicks, purchases, CTR, CPC, ROAS)
+def calculate_totals(meta_data):
+    rows = []  # List to store each row of data to be written to Google Sheets
+
+    if meta_data:
+        for campaign in meta_data:
+            date = campaign.get('date_start', 'Unknown Date')
+
+            # Get total spend (keep it as float for now)
+            total_spent = float(campaign.get('spend', 0))
+
+            # Get total clicks (leave as float)
+            total_clicks = float(campaign.get('clicks', 0))
+
+            # Get total revenue (from 'onsite_web_app_purchase') and count the number of purchases (from 'purchase')
+            total_revenue = 0.0
+            total_purchases = 0
+
+            # Log actions and action_values for debugging
+            if 'actions' in campaign:
+                print(f"Actions: {campaign['actions']}")  # Debugging action values
+                for action in campaign['actions']:
+                    if action['action_type'] == 'purchase':  # Correct logic for counting purchases
+                        total_purchases += int(action.get('value', 0))  # Increment purchases (assuming value represents count)
+            
+            if 'action_values' in campaign:
+                print(f"Action Values: {campaign['action_values']}")  # Log action values for debugging
+                for action_value in campaign['action_values']:
+                    if action_value['action_type'] == 'onsite_web_app_purchase':
+                        total_revenue += float(action_value.get('value', 0))  # Add revenue from onsite_web_app_purchase
+
+            # Calculate CTR (Click-Through Rate) and CPC (Cost Per Click)
+            total_impressions = float(campaign.get('impressions', 0))  # Get total impressions
+            ctr = (total_clicks / total_impressions) * 100 if total_impressions > 0 else 0
+            cpc = total_spent / total_clicks if total_clicks > 0 else 0
+
+            # Calculate ROAS (Return on Ad Spend)
+            roas = total_revenue / total_spent if total_spent > 0 else 0
+
+            # Now format the values after all calculations are done
+            total_spent = f"€{total_spent:.2f}"  # Format cost as Euro
+            total_revenue = f"€{total_revenue:.2f}"  # Format revenue as Euro
+            ctr = f"{ctr:.2f}%"  # Format CTR as percentage
+            cpc = f"€{cpc:.2f}"  # Format CPC as Euro
+            roas = f"{roas:.2f}"  # Format ROAS as a plain number
+
+            # Add the calculated data to rows list
+            rows.append([date, total_spent, total_revenue, round(total_clicks), total_purchases, ctr, cpc, roas])
+
+    return rows
+
+
+# Function to batch update data in Google Sheets (batching the writes)
+def batch_write_to_google_sheets(rows, sheet_name: str = "Meta Ads"):
+    HEADER = ["Date", "Cost", "Revenue", "Clicks", "Purchases", "CTR", "CPC", "ROAS"]
+
+    try:
+        # Authenticate with Google Sheets using the service account
+        gc = gspread.service_account(filename='service_account.json')
+        sh = gc.open("xxx")  # Ensure this is the correct spreadsheet name
+        worksheet = sh.worksheet(sheet_name)  # Access the worksheet named xxx"
+
+        # Prepare the batch request in chunks to avoid exceeding the quota
+        CHUNK_SIZE = 100  # Set the chunk size for batch writing
+
+        # Check if header exists, insert if missing
+        data = worksheet.get_all_values()
+        if not data or data[0] != HEADER:
+            print(f"Inserting header: {HEADER}")
+            worksheet.update('A1:H1', [HEADER])
+
+            # Freeze the first row
+            worksheet.freeze(rows=1)
+            print("First row frozen.")
+
+        # Write rows in chunks
+        row_number = 2  # Start after the header
+        for i in range(0, len(rows), CHUNK_SIZE):
+            chunk = rows[i:i + CHUNK_SIZE]
+            range_to_write = f'A{row_number}:H{row_number + len(chunk) - 1}'
+            worksheet.update(range_to_write, chunk)
+            row_number += len(chunk)
+            print(f"Wrote {len(chunk)} rows.")
+
+        print(f"Successfully wrote {len(rows)} rows to Google Sheets.")
+
+    except Exception as e:
+        print(f"Error writing to Google Sheets: {str(e)}")
+
+
+# Main script to fetch Meta Ads data and write totals for revenue and spend
+def meta_script_for_specific_actions():
+    try:
+        # Fetch data for the range with daily breakdowns
+        print(f"Fetching Meta Ads data from September 1st to today...\n")
+        meta_data = fetch_meta_ads_data()
+
+        if meta_data:
+            rows = calculate_totals(meta_data)
+            if rows:
+                batch_write_to_google_sheets(rows, "xxx")  # Only pass two arguments
+            else:
+                print("No data to write to Google Sheets.")
+        else:
+            print(f"No Meta Ads data found for the date range to write to Google Sheets.")
+
+        return f"Meta Ads data successfully fetched and added to Google Sheets."
+
+    except Exception as e:
+        print(f"Script encountered an error: {str(e)}")
+
+
+# Entry point for Google Cloud Function
+@functions_framework.cloud_event
+def hello_pubsub(cloud_event):
+    # Trigger the Meta Ads data fetch and write to Google Sheets process
+    meta_script_for_specific_actions()
